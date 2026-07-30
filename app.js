@@ -288,6 +288,54 @@
     return value.trim().replace(/\/+$/, '');
   }
 
+  function extractGeminiText(data) {
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (!Array.isArray(parts)) return '';
+    return parts
+      .filter(part => typeof part?.text === 'string')
+      .map(part => part.text)
+      .join('');
+  }
+
+  function describeGeminiEmptyResponse(data) {
+    const candidate = data?.candidates?.[0];
+    const finishReason = candidate?.finishReason;
+    const blockReason = data?.promptFeedback?.blockReason;
+    if (blockReason) return `請求被 Gemini 安全機制阻擋：${blockReason}`;
+    if (finishReason && finishReason !== 'STOP') return `Gemini 未產生文字，結束原因：${finishReason}`;
+    return '';
+  }
+
+  async function requestNonStreaming(url, payload, signal) {
+    const fallbackUrl = url.replace(':streamGenerateContent?alt=sse', ':generateContent');
+    const response = await fetch(fallbackUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': state.settings.apiKey.trim()
+      },
+      body: JSON.stringify(payload),
+      signal
+    });
+
+    if (!response.ok) {
+      let details = '';
+      try {
+        const errorData = await response.json();
+        details = errorData?.error?.message || JSON.stringify(errorData);
+      } catch {
+        details = await response.text();
+      }
+      throw new Error(`${response.status} ${response.statusText}${details ? `：${details}` : ''}`);
+    }
+
+    const data = await response.json();
+    return {
+      text: extractGeminiText(data),
+      reason: describeGeminiEmptyResponse(data)
+    };
+  }
+
   async function sendMessage(prefill) {
     if (abortController) {
       abortController.abort();
@@ -356,36 +404,50 @@
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let lastReason = '';
+
+      const processSseBlock = block => {
+        const dataLines = block
+          .split('\n')
+          .map(line => line.trimEnd())
+          .filter(line => line.startsWith('data:'));
+
+        for (const line of dataLines) {
+          const raw = line.slice(5).trim();
+          if (!raw || raw === '[DONE]') continue;
+          try {
+            const data = JSON.parse(raw);
+            const chunk = extractGeminiText(data);
+            lastReason = describeGeminiEmptyResponse(data) || lastReason;
+            if (chunk) {
+              assistantMessage.text += chunk;
+              renderMessages();
+            }
+          } catch (parseError) {
+            console.warn('忽略無法解析的串流片段：', raw, parseError);
+          }
+        }
+      };
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
+        buffer = buffer.replace(/\r\n/g, '\n');
         const events = buffer.split('\n\n');
         buffer = events.pop() || '';
-
-        for (const event of events) {
-          const dataLines = event.split('\n').filter(line => line.startsWith('data:'));
-          for (const line of dataLines) {
-            const raw = line.slice(5).trim();
-            if (!raw || raw === '[DONE]') continue;
-            try {
-              const data = JSON.parse(raw);
-              const chunk = data?.candidates?.[0]?.content?.parts
-                ?.map(part => part.text || '')
-                .join('') || '';
-              if (chunk) {
-                assistantMessage.text += chunk;
-                renderMessages();
-              }
-            } catch (parseError) {
-              console.warn('忽略無法解析的串流片段：', parseError);
-            }
-          }
-        }
+        events.forEach(processSseBlock);
       }
 
-      if (!assistantMessage.text.trim()) assistantMessage.text = '模型沒有回傳文字內容。';
+      buffer += decoder.decode();
+      buffer = buffer.replace(/\r\n/g, '\n').trim();
+      if (buffer) processSseBlock(buffer);
+
+      if (!assistantMessage.text.trim()) {
+        console.warn('串流沒有取得文字，改用 generateContent 備援。');
+        const fallback = await requestNonStreaming(url, payload, abortController.signal);
+        assistantMessage.text = fallback.text || fallback.reason || lastReason || 'Gemini 沒有回傳可顯示的文字內容。';
+      }
     } catch (error) {
       if (error.name === 'AbortError') {
         assistantMessage.text = assistantMessage.text.trim() || '（已停止生成）';
