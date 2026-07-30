@@ -1,4 +1,6 @@
 # Gemini GitHub Chat
+https://youjianchonglangshou-design.github.io/gemini-github-chat/
+
 
 一個可直接部署到 **GitHub Pages** 的 Gemini 對話網頁。純 HTML、CSS、JavaScript，不需要 Node.js、Python 或伺服器。
 
